@@ -14,10 +14,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * PDFBox Text Cropper CLI application.
+ * PDFBox Text Cropper / Splitter CLI application.
  *
- * <p>Finds a text string on every page, crops around the match, and saves output PDF.
- * Pages where the needle is not found are left unchanged.
+ * <p>Supports two modes:
+ * <ul>
+ *   <li><b>crop</b> – finds a text string on every page, crops around the match, and saves output PDF.</li>
+ *   <li><b>split</b> – splits an input PDF into multiple output PDFs at every page that contains a marker text.</li>
+ * </ul>
  */
 public class App {
 
@@ -29,8 +32,30 @@ public class App {
             System.exit(0);
         }
 
+        String command = args[0];
+
+        if ("split".equals(command)) {
+            runSplit(args);
+            return;
+        }
+
+        // "crop" subcommand (explicit) or legacy positional usage (backward compatible)
+        if ("crop".equals(command)) {
+            String[] cropArgs = new String[args.length - 1];
+            System.arraycopy(args, 1, cropArgs, 0, cropArgs.length);
+            runCrop(cropArgs);
+        } else {
+            runCrop(args);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Crop mode
+    // -------------------------------------------------------------------------
+
+    private static void runCrop(String[] args) throws IOException {
         if (args.length < 3) {
-            System.err.println("Error: requires at least 3 positional arguments: <input.pdf> <output.pdf> <needle>");
+            System.err.println("Error: crop mode requires at least 3 positional arguments: <input.pdf> <output.pdf> <needle>");
             printUsage();
             System.exit(1);
         }
@@ -109,6 +134,137 @@ public class App {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Split mode
+    // -------------------------------------------------------------------------
+
+    /**
+     * Splits an input PDF into multiple output PDFs based on a marker text.
+     * The page that contains the marker becomes the FIRST page of the new output chunk.
+     * If the marker is never found, nothing is written and the process exits non-zero.
+     *
+     * @param args full args array starting with "split"
+     */
+    private static void runSplit(String[] args) throws IOException {
+        if (args.length < 4) {
+            System.err.println("Error: split mode requires: split <input.pdf> <output-dir> <marker-text>");
+            printUsage();
+            System.exit(1);
+        }
+
+        String inputPath = args[1];
+        String outputDir = args[2];
+        String marker = args[3];
+
+        boolean caseInsensitive = hasFlag(args, "--case-insensitive");
+        boolean includeFirstChunk = hasFlag(args, "--include-first-chunk");
+        int minPages = 0;
+
+        // Parse --min-pages value
+        for (int i = 4; i < args.length; i++) {
+            if ("--min-pages".equals(args[i])) {
+                if (i + 1 >= args.length) {
+                    System.err.println("Error: --min-pages requires an integer value");
+                    System.exit(1);
+                }
+                try {
+                    minPages = Integer.parseInt(args[i + 1]);
+                    i++; // skip value token
+                } catch (NumberFormatException e) {
+                    System.err.println("Error: --min-pages value must be an integer, got: " + args[i + 1]);
+                    System.exit(1);
+                }
+            }
+        }
+
+        File inputFile = new File(inputPath);
+        if (!inputFile.exists()) {
+            System.err.println("Error: input file not found: " + inputPath);
+            System.exit(1);
+        }
+
+        try (PDDocument doc = Loader.loadPDF(inputFile)) {
+            int pageCount = doc.getNumberOfPages();
+
+            // Scan pages and collect the 0-indexed page numbers where the marker appears
+            PDFTextStripper stripper = new PDFTextStripper();
+            stripper.setSortByPosition(true);
+            List<Integer> markerPages = new ArrayList<>();
+
+            for (int i = 0; i < pageCount; i++) {
+                stripper.setStartPage(i + 1);
+                stripper.setEndPage(i + 1);
+                StringWriter sw = new StringWriter();
+                stripper.writeText(doc, sw);
+                String pageText = sw.toString();
+
+                String searchText = caseInsensitive ? pageText.toLowerCase() : pageText;
+                String searchMarker = caseInsensitive ? marker.toLowerCase() : marker;
+
+                if (searchText.contains(searchMarker)) {
+                    markerPages.add(i);
+                }
+            }
+
+            if (markerPages.isEmpty()) {
+                System.err.println("Error: split marker not found in any page: " + marker);
+                System.exit(2);
+            }
+
+            // Build chunk ranges [startPage, endPage) in 0-based indices
+            List<int[]> chunks = new ArrayList<>();
+
+            // Optional first chunk: pages 0..(firstMarkerPage-1)
+            int firstMarker = markerPages.get(0);
+            if (includeFirstChunk && firstMarker > 0) {
+                chunks.add(new int[]{0, firstMarker});
+            }
+
+            // One chunk per marker page, extending to the next marker (or end of document)
+            for (int i = 0; i < markerPages.size(); i++) {
+                int start = markerPages.get(i);
+                int end = (i + 1 < markerPages.size()) ? markerPages.get(i + 1) : pageCount;
+                chunks.add(new int[]{start, end});
+            }
+
+            // Apply --min-pages filter
+            final int minPagesFilter = minPages;
+            if (minPagesFilter > 0) {
+                chunks.removeIf(chunk -> (chunk[1] - chunk[0]) < minPagesFilter);
+            }
+
+            if (chunks.isEmpty()) {
+                System.err.println("Error: no output chunks remain after filtering (--min-pages too large?)");
+                System.exit(2);
+            }
+
+            // Create output directory only when we are about to write
+            File outDir = new File(outputDir);
+            if (!outDir.exists() && !outDir.mkdirs()) {
+                System.err.println("Error: could not create output directory: " + outputDir);
+                System.exit(1);
+            }
+
+            // Write each chunk as out-NNN.pdf
+            int chunkNum = 1;
+            for (int[] chunk : chunks) {
+                try (PDDocument chunkDoc = new PDDocument()) {
+                    for (int p = chunk[0]; p < chunk[1]; p++) {
+                        chunkDoc.addPage(chunkDoc.importPage(doc.getPage(p)));
+                    }
+                    String outName = String.format("out-%03d.pdf", chunkNum++);
+                    File outFile = new File(outDir, outName);
+                    chunkDoc.save(outFile);
+                    System.out.println("Saved: " + outFile.getPath());
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
     private static boolean hasFlag(String[] args, String flag) {
         for (String arg : args) {
             if (flag.equals(arg)) {
@@ -119,14 +275,27 @@ public class App {
     }
 
     private static void printUsage() {
-        System.out.println("Usage: mvn exec:java -Dexec.args=\"<input.pdf> <output.pdf> <needle> [options]\"");
+        System.out.println("Usage:");
         System.out.println();
-        System.out.println("Options:");
-        System.out.println("  --pad <points>        Padding around match in PDF points (default: 12)");
-        System.out.println("  --case-insensitive    Case-insensitive needle matching");
-        System.out.println("  --fail-if-not-found   Exit non-zero if needle not found on any page");
-        System.out.println("  --first-only          Crop only the first page where needle is found");
-        System.out.println("  --help, -h            Show this help message");
+        System.out.println("  Crop mode:");
+        System.out.println("    mvn exec:java -Dexec.args=\"[crop] <input.pdf> <output.pdf> <needle> [options]\"");
+        System.out.println();
+        System.out.println("  Crop options:");
+        System.out.println("    --pad <points>        Padding around match in PDF points (default: 12)");
+        System.out.println("    --case-insensitive    Case-insensitive needle matching");
+        System.out.println("    --fail-if-not-found   Exit non-zero if needle not found on any page");
+        System.out.println("    --first-only          Crop only the first page where needle is found");
+        System.out.println();
+        System.out.println("  Split mode:");
+        System.out.println("    mvn exec:java -Dexec.args=\"split <input.pdf> <output-dir> <marker-text> [options]\"");
+        System.out.println();
+        System.out.println("  Split options:");
+        System.out.println("    --case-insensitive    Case-insensitive marker matching");
+        System.out.println("    --include-first-chunk Include pages before the first marker as an extra first chunk");
+        System.out.println("    --min-pages <n>       Skip chunks with fewer than n pages");
+        System.out.println();
+        System.out.println("  General:");
+        System.out.println("    --help, -h            Show this help message");
     }
 
     // -------------------------------------------------------------------------
